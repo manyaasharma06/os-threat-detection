@@ -1,4 +1,4 @@
-# Resource Monitoring Module (Person 3)
+# Resource Monitoring Module - Ishani Nair
 
 Samples system-wide CPU and memory utilisation and tracks per-process PID, name, CPU estimate, and memory use. It emits threshold alerts in a shared JSON-compatible event envelope for central correlation/storage.
 
