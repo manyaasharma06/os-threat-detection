@@ -181,3 +181,21 @@ Observations:
 - Score weights and the 60-second window are fixed values chosen by us; they could be made configurable.
 - Correlation uses PID and time only; it does not track parent/child processes.
 - Alerts are printed to the console and stored in SQLite; there is no dashboard.
+
+## 8. Integration with Resource Monitor (Person 3)
+
+Person 3's monitor uses its own `SecurityEvent` format, so `core/adapters.py`
+converts it into the shared `Event`:
+
+| Resource monitor event | Shared event_type |
+|---|---|
+| sustained_system_resource_spike (system_cpu) | HIGH_SYSTEM_CPU |
+| sustained_system_resource_spike (system_memory) | HIGH_SYSTEM_MEMORY |
+| sustained_process_resource_spike | HIGH_PROCESS_RESOURCE (pid and name kept) |
+
+`main.py` creates one `ThreatEngine` and passes events from the monitor's
+callback into `engine.submit()`.
+
+Tests: `tests/test_adapters.py` (3 tests) check each mapping. All 8 tests
+pass. A live run with the memory threshold lowered stored
+HIGH_SYSTEM_MEMORY events in the database.
