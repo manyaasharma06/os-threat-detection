@@ -75,3 +75,21 @@ def from_filesystem_event(data):
         value=details.get("changes_in_window"),
         details=details,
     )
+
+def from_process_event(data):
+    """Convert a process-monitor dictionary into the shared Event format."""
+    event_type = data.get("event_type", "UNKNOWN")
+
+    pid = data.get("pid")
+    process_name = data.get("process_name", "Unknown")
+    details = dict(data.get("details") or {})
+
+    return Event(
+        source="process",
+        event_type=event_type,
+        description=data.get("description", f"{event_type}: {process_name}"),
+        pid=pid,
+        process_name=process_name,
+        value=data.get("value"),
+        details=details,
+    )
