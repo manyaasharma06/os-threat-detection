@@ -52,8 +52,20 @@ class ResourceMonitor:
         self.callback = callback
         self._system_streak: dict[str, int] = {}
         self._process_streak: dict[tuple[int, str], int] = {}
+        self._process_cpu_previous: dict[tuple, tuple[float, float]] = {}
         self._previous_cpu = self._read_cpu_counters()
         self._running = False
+
+    def _sample_process_cpu(self, identity: tuple, cpu_seconds: float) -> float:
+        """Return process CPU percentage since the previous sample (100% = one core)."""
+        now = time.monotonic()
+        previous = self._process_cpu_previous.get(identity)
+        self._process_cpu_previous[identity] = (now, cpu_seconds)
+        if previous is None:
+            return 0.0
+        elapsed = now - previous[0]
+        consumed = max(0.0, cpu_seconds - previous[1])
+        return (consumed * 100.0 / elapsed) if elapsed > 0 else 0.0
 
     def _read_cpu_counters(self):
         if platform.system() == "Linux":
@@ -140,12 +152,9 @@ class ResourceMonitor:
 
     def _linux_processes(self) -> list[dict]:
         result = []
-        try:
-            with open("/proc/stat", encoding="ascii") as f:
-                total_ticks = sum(map(int, f.readline().split()[1:]))
-        except (OSError, ValueError):
-            total_ticks = 0
+        active_identities = set()
         page = os.sysconf("SC_PAGE_SIZE")
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
                 continue
@@ -155,28 +164,74 @@ class ResourceMonitor:
                 fields = raw[raw.rfind(")") + 2:].split()
                 name = raw[raw.find("(") + 1:raw.rfind(")")]
                 ticks = int(fields[11]) + int(fields[12])
+                start_time = int(fields[19])
                 rss = max(0, int(fields[21]) * page)
-                result.append({"pid": pid, "name": name, "cpu_percent": 100.0 * ticks / total_ticks if total_ticks else 0.0,
+                identity = (pid, start_time)
+                active_identities.add(identity)
+                result.append({"pid": pid, "name": name,
+                               "cpu_percent": self._sample_process_cpu(identity, ticks / ticks_per_second),
                                "memory_bytes": rss})
             except (OSError, ValueError, IndexError, ProcessLookupError):
                 continue
+        self._process_cpu_previous = {
+            key: value for key, value in self._process_cpu_previous.items() if key in active_identities
+        }
         return result
 
     def _windows_processes(self) -> list[dict]:
         import ctypes
         from ctypes import wintypes
         psapi, kernel = ctypes.windll.psapi, ctypes.windll.kernel32
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE,
+                                             wintypes.LPWSTR, wintypes.DWORD]
+        psapi.GetModuleBaseNameW.restype = wintypes.DWORD
+        kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                      wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
         pids = (wintypes.DWORD * 4096)(); needed = wintypes.DWORD()
         if not psapi.EnumProcesses(ctypes.byref(pids), ctypes.sizeof(pids), ctypes.byref(needed)):
             return []
         result = []
+        active_identities = set()
         for pid in pids[:needed.value // ctypes.sizeof(wintypes.DWORD)]:
             handle = kernel.OpenProcess(0x1000 | 0x0400, False, pid)
             if not handle:
                 continue
             try:
-                buf = ctypes.create_unicode_buffer(260)
-                psapi.GetModuleBaseNameW(handle, None, buf, len(buf))
+                name = "?"
+                buf = ctypes.create_unicode_buffer(1024)
+                if psapi.GetModuleBaseNameW(handle, None, buf, len(buf)):
+                    name = buf.value
+                else:
+                    image_size = wintypes.DWORD(len(buf))
+                    if kernel.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(image_size)):
+                        name = os.path.basename(buf.value)
+                class FILETIME(ctypes.Structure):
+                    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+                creation, exit_time, kernel_time, user_time = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                cpu_percent = 0.0
+                kernel.GetProcessTimes.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                    ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                ]
+                kernel.GetProcessTimes.restype = wintypes.BOOL
+                if kernel.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                                          ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    def filetime_seconds(value):
+                        ticks_100ns = (value.dwHighDateTime << 32) | value.dwLowDateTime
+                        return ticks_100ns / 10_000_000.0
+
+                    identity = (int(pid), (creation.dwHighDateTime << 32) | creation.dwLowDateTime)
+                    active_identities.add(identity)
+                    cpu_percent = self._sample_process_cpu(
+                        identity, filetime_seconds(kernel_time) + filetime_seconds(user_time)
+                    )
                 class PMC(ctypes.Structure):
                     _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                                 ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
@@ -185,10 +240,13 @@ class ResourceMonitor:
                                 ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
                 pmc = PMC(); pmc.cb = ctypes.sizeof(pmc)
                 psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb)
-                result.append({"pid": int(pid), "name": buf.value or "?", "cpu_percent": 0.0,
+                result.append({"pid": int(pid), "name": name, "cpu_percent": cpu_percent,
                                "memory_bytes": int(pmc.WorkingSetSize)})
             finally:
                 kernel.CloseHandle(handle)
+        self._process_cpu_previous = {
+            key: value for key, value in self._process_cpu_previous.items() if key in active_identities
+        }
         return result
 
     def _mac_processes(self) -> list[dict]:
