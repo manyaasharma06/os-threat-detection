@@ -1,93 +1,39 @@
-import threading
-import time
-from pathlib import Path
+"""Run the three monitors and send normalized events to Person 4's engine."""
+import argparse
+import logging
 
 from core.engine import ThreatEngine
-from core.adapters import (
-    from_resource_event,
-    from_filesystem_event,
-    from_process_event,
-)
-from resource_monitoring.resource_monitor import ResourceMonitor, MonitorConfig
-from filesystem_monitoring.file_monitor import FileSystemMonitor
-from process_monitor import monitor_processes
+from monitoring.coordinator import CoordinatorConfig, MonitoringCoordinator
 
 
-def main():
-    project_dir = Path(__file__).resolve().parent
-    db_path = project_dir / "threats.db"
-    test_dir = project_dir / "monitor_test_files"
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run the integrated monitoring layer")
+    parser.add_argument("--watch-path", required=True,
+                        help="Dedicated directory to monitor for file activity")
+    parser.add_argument("--db", default="threats.db", help="SQLite database path")
+    parser.add_argument("--process-interval", type=float, default=2.0)
+    parser.add_argument("--resource-interval", type=float, default=1.0)
+    parser.add_argument("--sustained-samples", type=int, default=3)
+    args = parser.parse_args(argv)
 
-    test_dir.mkdir(exist_ok=True)
-
-    engine = ThreatEngine(str(db_path))
-    stop = threading.Event()
-
-    # Person 3: resource monitoring
-    def on_resource_event(sec_event):
-        engine.submit(from_resource_event(sec_event))
-
-    resource = ResourceMonitor(
-        MonitorConfig(),
-        callback=on_resource_event,
-    )
-
-    # Person 2: filesystem monitoring
-    def on_filesystem_event(data):
-        score, level = engine.submit(from_filesystem_event(data))
-        print(f"[FILESYSTEM] Threat score={score}, severity={level}")
-
-    filesystem = FileSystemMonitor(
-        watch_path=str(test_dir),
-        recursive=True,
-        callback=on_filesystem_event,
-    )
-
-    # Person 1: process monitoring
-    def on_process_event(data):
-        score, level = engine.submit(from_process_event(data))
-        print(f"[PROCESS] Threat score={score}, severity={level}")
-
-    threads = [
-        threading.Thread(
-            target=resource.run,
-            args=(stop,),
-            daemon=True,
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+    engine = ThreatEngine(args.db)
+    coordinator = MonitoringCoordinator(
+        engine.submit,
+        filesystem_path=args.watch_path,
+        config=CoordinatorConfig(
+            process_poll_interval_seconds=args.process_interval,
+            resource_interval_seconds=args.resource_interval,
+            resource_sustained_samples=args.sustained_samples,
         ),
-        threading.Thread(
-            target=monitor_processes,
-            kwargs={
-                "stop_event": stop,
-                "callback": on_process_event,
-            },
-            daemon=True,
-        ),
-    ]
-
-    filesystem.start()
-
-    for thread in threads:
-        thread.start()
-
-    print("\nThreat detection running.")
-    print("Process and resource monitors are active.")
-    print(f"Filesystem monitoring: {test_dir}")
-    print("Press Ctrl+C to stop.")
-
+    )
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nStopping monitors...")
-        stop.set()
+        print("Integrated monitoring running. Press Ctrl+C to stop.", flush=True)
+        coordinator.run_forever()
     finally:
-        filesystem.stop()
-
-        for thread in threads:
-            thread.join(timeout=3)
-
+        coordinator.stop()
         engine.db.close()
-        print("Threat detection stopped.")
 
 
 if __name__ == "__main__":

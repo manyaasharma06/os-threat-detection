@@ -35,6 +35,12 @@ class ResourceMonitorTests(unittest.TestCase):
         self.assertEqual(events[0].event_type, "sustained_process_resource_spike")
         self.assertEqual(events[0].details["pid"], 7)
 
+    @patch("resource_monitor.time.monotonic", side_effect=[10.0, 11.0])
+    def test_process_cpu_is_sample_delta_not_since_boot_average(self, _):
+        identity = (123, 456)
+        self.assertEqual(self.monitor._sample_process_cpu(identity, 4.0), 0.0)
+        self.assertAlmostEqual(self.monitor._sample_process_cpu(identity, 4.8), 80.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

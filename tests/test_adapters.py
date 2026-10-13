@@ -1,5 +1,6 @@
 from resource_monitoring.resource_monitor import SecurityEvent
 from core.adapters import from_resource_event
+from core.adapters import from_filesystem_event, from_process_event
 
 
 def make(event_type, details):
@@ -27,3 +28,40 @@ def test_process_mapping_keeps_pid():
     assert e.event_type == "HIGH_PROCESS_RESOURCE"
     assert e.pid == 7
     assert e.process_name == "worker"
+
+
+def test_process_event_mapping_keeps_pid_cpu_and_timestamp():
+    e = from_process_event("HIGH_CPU_PROCESS",
+        {"pid": 1234, "name": "worker.exe", "cpu": 88.5},
+        "2026-10-13T10:30:00+00:00")
+    assert e.source == "process"
+    assert e.event_type == "HIGH_CPU_PROCESS"
+    assert e.pid == 1234
+    assert e.process_name == "worker.exe"
+    assert e.value == 88.5
+    assert e.timestamp == 1791887400.0
+
+
+def test_filesystem_move_maps_to_shared_rename_event():
+    e = from_filesystem_event({
+        "timestamp": "2026-10-13T10:30:00+00:00",
+        "event_type": "FILE_MOVED",
+        "source": "filesystem_monitor",
+        "path": "old.txt",
+        "destination": "new.txt",
+    })
+    assert e.source == "filesystem"
+    assert e.event_type == "FILE_RENAMED"
+    assert e.details == {"path": "old.txt", "destination": "new.txt"}
+    assert e.timestamp == 1791887400.0
+
+
+def test_filesystem_mass_change_keeps_count():
+    e = from_filesystem_event({
+        "timestamp": "2026-10-13T10:30:00+00:00",
+        "event_type": "MASS_FILE_CHANGE",
+        "path": "sample.dat",
+        "details": {"changes_in_window": 25, "window_seconds": 10},
+    })
+    assert e.event_type == "MASS_FILE_CHANGE"
+    assert e.value == 25.0

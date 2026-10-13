@@ -13,19 +13,32 @@ from watchdog.observers import Observer
 class FileMonitorHandler(FileSystemEventHandler):
     """Detect file-system events and flag unusually frequent changes."""
 
-    def __init__(self, mass_change_threshold=20, time_window=10, callback=None):
+    def __init__(
+        self,
+        mass_change_threshold=20,
+        time_window=10,
+        callback=None,
+        ransomware_change_threshold=8,
+        suspicious_extension_threshold=2,
+        suspicious_extensions=(".locked", ".encrypted", ".crypt", ".enc"),
+    ):
         super().__init__()
+        if mass_change_threshold < 1 or time_window <= 0:
+            raise ValueError("mass_change_threshold and time_window must be positive")
+        if ransomware_change_threshold < 1 or suspicious_extension_threshold < 1:
+            raise ValueError("ransomware thresholds must be positive")
         self.mass_change_threshold = mass_change_threshold
         self.time_window = time_window
+        self.ransomware_change_threshold = ransomware_change_threshold
+        self.suspicious_extension_threshold = suspicious_extension_threshold
+        self.suspicious_extensions = {ext.lower() for ext in suspicious_extensions}
         self.callback = callback
         self.recent_changes = deque()
         self.lock = Lock()
         self.reported_mass_change = False
+        self.reported_ransomware_pattern = False
 
     def _record_event(self, event_type, path, destination=None):
-        if getattr(self, "_ignore_next", False):
-            return
-
         now = time.time()
 
         event = {
@@ -39,36 +52,63 @@ class FileMonitorHandler(FileSystemEventHandler):
         if destination:
             event["destination"] = str(destination)
 
+        events = [event]
         with self.lock:
-            self.recent_changes.append(now)
+            self.recent_changes.append((now, event_type, str(path), str(destination) if destination else None))
 
             while (
                 self.recent_changes
-                and now - self.recent_changes[0] > self.time_window
+                and now - self.recent_changes[0][0] > self.time_window
             ):
                 self.recent_changes.popleft()
 
-            if len(self.recent_changes) >= self.mass_change_threshold:
-                event["event_type"] = "MASS_FILE_CHANGE"
-                event["severity"] = "HIGH"
-                event["details"] = {
-                    "changes_in_window": len(self.recent_changes),
-                    "window_seconds": self.time_window,
-                }
-
-                if self.reported_mass_change:
-                    should_report = False
-                else:
+            change_count = len(self.recent_changes)
+            if change_count >= self.mass_change_threshold:
+                if not self.reported_mass_change:
+                    events.append({
+                        **event,
+                        "event_type": "MASS_FILE_CHANGE",
+                        "severity": "HIGH",
+                        "details": {
+                            "changes_in_window": change_count,
+                            "window_seconds": self.time_window,
+                        },
+                    })
                     self.reported_mass_change = True
-                    should_report = True
             else:
-                should_report = True
+                # Re-arm after the old burst has aged out of the time window.
+                self.reported_mass_change = False
 
-        if should_report:
-            print(json.dumps(event, indent=2))
+            suspicious_paths = sorted({
+                destination or source
+                for _, _, source, destination in self.recent_changes
+                if Path(destination or source).suffix.lower() in self.suspicious_extensions
+            })
+            if (
+                change_count >= self.ransomware_change_threshold
+                and len(suspicious_paths) >= self.suspicious_extension_threshold
+            ):
+                if not self.reported_ransomware_pattern:
+                    events.append({
+                        **event,
+                        "event_type": "RANSOMWARE_PATTERN",
+                        "severity": "CRITICAL",
+                        "details": {
+                            "changes_in_window": change_count,
+                            "window_seconds": self.time_window,
+                            "suspicious_extension_count": len(suspicious_paths),
+                            "suspicious_extensions": sorted({Path(p).suffix.lower() for p in suspicious_paths}),
+                            "paths_sample": suspicious_paths[-10:],
+                        },
+                    })
+                    self.reported_ransomware_pattern = True
+            else:
+                self.reported_ransomware_pattern = False
 
+        for emitted in events:
+            print(json.dumps(emitted, indent=2))
             if self.callback:
-                self.callback(event)
+                self.callback(emitted)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -92,7 +132,10 @@ class FileMonitorHandler(FileSystemEventHandler):
     
     def dispatch(self, event):
         """Ignore Git and virtual-environment internals."""
-        ignored_parts = {".git", ".venv", "venv", "__pycache__"}
+        ignored_parts = {".git", ".venv", "venv", "__pycache__", ".pytest_cache"}
+        ignored_suffixes = (".db", ".db-journal", ".db-wal", ".db-shm",
+                            ".sqlite", ".sqlite-journal", ".sqlite-wal", ".sqlite-shm",
+                            ".sqlite3", ".log")
 
         paths = [getattr(event, "src_path", "")]
         destination = getattr(event, "dest_path", None)
@@ -101,8 +144,11 @@ class FileMonitorHandler(FileSystemEventHandler):
             paths.append(destination)
 
         for path in paths:
-            if path and ignored_parts.intersection(Path(path).parts):
-                return
+            if path:
+                candidate = Path(path)
+                parts = {part.casefold() for part in candidate.parts}
+                if ignored_parts.intersection(parts) or candidate.name.casefold().endswith(ignored_suffixes):
+                    return
 
         super().dispatch(event)
 
@@ -118,6 +164,8 @@ class FileSystemMonitor:
         mass_change_threshold=20,
         time_window=10,
         callback=None,
+        ransomware_change_threshold=8,
+        suspicious_extension_threshold=2,
     ):
         self.watch_path = Path(watch_path).expanduser().resolve()
 
@@ -135,6 +183,8 @@ class FileSystemMonitor:
             mass_change_threshold=mass_change_threshold,
             time_window=time_window,
             callback=callback,
+            ransomware_change_threshold=ransomware_change_threshold,
+            suspicious_extension_threshold=suspicious_extension_threshold,
         )
         self.observer = Observer()
         self.recursive = recursive
